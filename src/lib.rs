@@ -1,36 +1,8 @@
-//! Utilities to work with Maven project files and repositories implemented in
-//! Rust.
-//!
-//! # Quick Start
-//!
-//! ```
-//! use maven_toolbox::{default_impl::*, *};
-//!
-//! // the artifact's GAV
-//! let artifact = ArtifactFqn::pom(
-//!     "com.walmartlabs.concord.plugins.basic",
-//!     "smtp-tasks",
-//!     "1.76.1",
-//! );
-//!
-//! let mut resolver = Resolver::default();
-//!
-//! // default implementations, you can plug in your own
-//! let url_fetcher = DefaultUrlFetcher {};
-//! let pom_parser = DefaultPomParser {};
-//!
-//! let project = resolver
-//!     .build_effective_pom(&artifact, &url_fetcher, &pom_parser)
-//!     .unwrap();
-//! ```
-//!
-//! The `build_effective_pom` call requires a [`UrlFetcher`] and a [`PomParser`].
-//! The [`default_impl`] module provides minimal implementations of of those
-//! traits.
-
-use parking_lot::Mutex;
-use std::collections::HashMap;
+use log::{debug, trace};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::cell::RefCell;
 
 #[cfg(feature = "default-impl")]
 pub mod default_impl;
@@ -50,9 +22,8 @@ impl Packaging {
                 use std::io::Read;
 
                 let zip_file = zip::read::ZipArchive::new(std::io::Cursor::new(bytes));
-
                 let mut bytes = vec![];
-                zip_file?.by_name("classes.jar")?.read_to_end(&mut bytes);
+                zip_file?.by_name("classes.jar")?.read_to_end(&mut bytes)?;
                 std::fs::write(location, bytes)?;
                 Ok(())
             }
@@ -65,7 +36,7 @@ impl Packaging {
 }
 
 #[derive(Default, Debug, Clone, Eq, PartialEq, Hash)]
-pub struct ArtifactFqn {
+pub struct Artifact {
     pub group_id: Option<String>,
     pub artifact_id: Option<String>,
     pub version: Option<String>,
@@ -73,7 +44,7 @@ pub struct ArtifactFqn {
     pub classifier: Option<String>,
 }
 
-impl ArtifactFqn {
+impl Artifact {
     pub fn new(
         group_id: &str,
         artifact_id: &str,
@@ -81,7 +52,7 @@ impl ArtifactFqn {
         packaging: &str,
         classifier: &str,
     ) -> Self {
-        ArtifactFqn {
+        Artifact {
             group_id: Some(group_id.to_owned()),
             artifact_id: Some(artifact_id.to_owned()),
             version: Some(version.to_owned()),
@@ -91,8 +62,14 @@ impl ArtifactFqn {
         }
     }
 
+    pub fn version_cleaned(&self) -> Option<String> {
+        self.version
+            .clone()
+            .map(|version| version.replace("[", "").replace("]", ""))
+    }
+
     pub fn pom(group_id: &str, artifact_id: &str, version: &str) -> Self {
-        ArtifactFqn {
+        Artifact {
             group_id: Some(group_id.to_owned()),
             artifact_id: Some(artifact_id.to_owned()),
             version: Some(version.to_owned()),
@@ -103,7 +80,7 @@ impl ArtifactFqn {
 
     pub fn interpolate(&self, properties: &HashMap<String, String>) -> Self {
         // TODO other fields
-        ArtifactFqn {
+        Artifact {
             version: self
                 .version
                 .clone()
@@ -125,7 +102,7 @@ impl ArtifactFqn {
     }
 
     pub fn with_packaging(&self, packaging: &str) -> Self {
-        ArtifactFqn {
+        Artifact {
             packaging: Some(packaging.to_owned()),
             ..self.clone()
         }
@@ -136,7 +113,7 @@ impl ArtifactFqn {
     }
 
     pub fn normalize(self, parent: &Self, default_packaging: &str) -> Self {
-        ArtifactFqn {
+        Artifact {
             group_id: self.group_id.or_else(|| parent.group_id.clone()),
             artifact_id: self.artifact_id.or_else(|| parent.artifact_id.clone()),
             version: self.version.or_else(|| parent.version.clone()),
@@ -146,9 +123,18 @@ impl ArtifactFqn {
             ..Default::default()
         }
     }
+
+    pub fn filename(&self) -> PathBuf {
+        PathBuf::from(format!(
+            "{}/{}.{}",
+            self.artifact_id.as_ref().unwrap(),
+            self.version_cleaned().as_ref().unwrap(),
+            self.packaging.as_ref().unwrap()
+        ))
+    }
 }
 
-impl std::fmt::Display for ArtifactFqn {
+impl std::fmt::Display for Artifact {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let def = "?".to_owned();
         write!(
@@ -165,7 +151,7 @@ impl std::fmt::Display for ArtifactFqn {
 
 #[derive(Default, Debug, Clone)]
 pub struct Dependency {
-    pub artifact_fqn: ArtifactFqn,
+    pub artifact_fqn: Artifact,
     pub scope: Option<String>,
 }
 
@@ -177,7 +163,7 @@ impl Dependency {
         }
     }
 
-    pub fn normalize(self, parent_id: &ArtifactFqn, default_packaging: &str) -> Self {
+    pub fn normalize(self, parent_id: &Artifact, default_packaging: &str) -> Self {
         Dependency {
             artifact_fqn: self.artifact_fqn.normalize(parent_id, default_packaging),
             scope: self.scope.or_else(|| Some("compile".to_owned())),
@@ -187,7 +173,7 @@ impl Dependency {
 
 #[derive(Debug, Clone)]
 pub struct Parent {
-    pub artifact_fqn: ArtifactFqn,
+    pub artifact_fqn: Artifact,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -216,7 +202,7 @@ pub struct DependencyManagement {
 #[derive(Debug, Clone)]
 pub struct Project {
     pub parent: Option<Parent>,
-    pub artifact_fqn: ArtifactFqn,
+    pub artifact_fqn: Artifact,
     pub dependency_management: Option<DependencyManagement>,
     pub dependencies: HashMap<DependencyKey, Dependency>,
     pub properties: HashMap<String, String>,
@@ -224,6 +210,21 @@ pub struct Project {
 
 pub struct Repository {
     pub base_url: String,
+}
+
+impl Repository {
+    pub fn google_maven() -> Arc<Self> {
+        let base_url = "https://dl.google.com/dl/android/maven2";
+        Arc::new(Self {
+            base_url: base_url.to_string(),
+        })
+    }
+
+    pub fn maven_central() -> Arc<Self> {
+        Arc::new(Repository {
+            base_url: "https://repo.maven.apache.org/maven2".into(),
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -240,7 +241,7 @@ pub struct ResolverError {
 }
 
 impl ResolverError {
-    pub fn missing_parameter<D: std::fmt::Display>(fqn: &ArtifactFqn, field_name: &D) -> Self {
+    pub fn missing_parameter<D: std::fmt::Display>(fqn: &Artifact, field_name: &D) -> Self {
         ResolverError {
             kind: ErrorKind::ClientError,
             msg: format!("'{}' is missing from {}", field_name, fqn),
@@ -254,7 +255,7 @@ impl ResolverError {
         }
     }
 
-    pub fn cant_resolve(artifact_id: &ArtifactFqn, cause: &str) -> Self {
+    pub fn cant_resolve(artifact_id: &Artifact, cause: &str) -> Self {
         ResolverError {
             kind: ErrorKind::ClientError,
             msg: format!("Can't resolve {:?}: {}", artifact_id, cause),
@@ -280,23 +281,26 @@ pub trait PomParser {
 
 pub struct Resolver {
     pub repositories: Vec<Arc<Repository>>,
-    pub project_cache: Mutex<HashMap<ArtifactFqn, Project>>,
+    pub project_cache: RefCell<HashMap<Artifact, Project>>,
+
+    url_fetcher: Box<dyn UrlFetcher>,
+    pom_parser: Box<dyn PomParser>,
 }
 
 impl Default for Resolver {
     fn default() -> Self {
         Resolver {
-            repositories: vec![Arc::new(Repository {
-                base_url: "https://repo.maven.apache.org/maven2".into(),
-            })],
-            project_cache: Mutex::new(HashMap::new()),
+            repositories: vec![Repository::maven_central()],
+            project_cache: RefCell::new(HashMap::new()),
+            url_fetcher: Box::new(default_impl::DefaultUrlFetcher {}),
+            pom_parser: Box::new(default_impl::DefaultPomParser {})
         }
     }
 }
 
 fn normalize_gavs(
     dependencies: HashMap<DependencyKey, Dependency>,
-    parent_fqn: &ArtifactFqn,
+    parent_fqn: &Artifact,
     default_packaging: &str,
 ) -> HashMap<DependencyKey, Dependency> {
     dependencies
@@ -309,20 +313,25 @@ fn normalize_gavs(
 }
 
 impl Resolver {
-    pub fn try_download_package<UF>(
+    pub fn new(repositories: &[Arc<Repository>]) -> Self {
+        Self {
+            repositories: repositories.to_vec(),
+            project_cache: RefCell::new(HashMap::new()),
+            url_fetcher: Box::new(default_impl::DefaultUrlFetcher {}),
+            pom_parser: Box::new(default_impl::DefaultPomParser {})
+        }
+    }
+
+    pub fn try_download_package(
         &self,
-        id: &ArtifactFqn,
-        url_fetcher: &UF,
+        id: &Artifact,
     ) -> Result<Packaging, ResolverError>
-    where
-        UF: UrlFetcher,
     {
         for repository in &self.repositories {
             for packaging in ["aar", "jar"] {
                 let packaged_id = id.with_packaging(packaging);
-                println!("{}", &id);
                 let url = Self::create_url_with_repository(repository, &packaged_id)?;
-                match url_fetcher.fetch_bytes(&url) {
+                match self.url_fetcher.fetch_bytes(&url) {
                     Ok(bytes) => {
                         return Ok(match packaging {
                             "aar" => Packaging::Aar(bytes),
@@ -330,7 +339,7 @@ impl Resolver {
                             _ => unimplemented!("Unsupported packaging type {packaging}"),
                         });
                     }
-                    err => println!("Trying other packaging: {:?}", err),
+                    err => debug!("Trying other packaging: {:?}", err),
                 }
             }
         }
@@ -343,16 +352,16 @@ impl Resolver {
 
     pub fn create_url_with_repository(
         repository: &Repository,
-        id: &ArtifactFqn,
+        id: &Artifact,
     ) -> Result<String, ResolverError> {
         // a little helper
         fn require<'a, F, D>(
-            id: &'a ArtifactFqn,
+            id: &'a Artifact,
             f: F,
             field_name: &D,
         ) -> Result<&'a String, ResolverError>
         where
-            F: Fn(&ArtifactFqn) -> Option<&String>,
+            F: Fn(&Artifact) -> Option<&String>,
             D: std::fmt::Display,
         {
             f(id).ok_or_else(|| ResolverError::missing_parameter(id, field_name))
@@ -360,10 +369,10 @@ impl Resolver {
 
         let group_id = require(id, |id| id.group_id.as_ref(), &"groupId")?;
         let artifact_id = require(id, |id| id.artifact_id.as_ref(), &"artifactId")?;
-        let version = require(id, |id| id.version.as_ref(), &"version")?
-            .replace("[", "")
-            .replace("]", "");
+        let _version = require(id, |id| id.version.as_ref(), &"version")?;
         let packaging = id.packaging.as_ref().map(|s| s.as_str()).unwrap_or("jar");
+
+        let version = id.version_cleaned().unwrap();
 
         let mut url = format!(
             "{}/{}/{}/{}/{}-{}",
@@ -384,22 +393,17 @@ impl Resolver {
         Ok(url)
     }
 
-    pub fn build_effective_pom<UF, P>(
+    pub fn build_effective_pom(
         &self,
-        project_id: &ArtifactFqn,
-        url_fetcher: &UF,
-        pom_parser: &P,
+        project_id: &Artifact,
     ) -> Result<Project, ResolverError>
-    where
-        UF: UrlFetcher,
-        P: PomParser,
     {
-        log::debug!("building an effective pom for {}", project_id);
+        debug!("building an effective pom for {}", project_id);
 
         let project_id = &project_id.with_packaging("pom");
         for repository in &self.repositories {
             let Ok(mut project) =
-                self.fetch_project(repository, project_id, url_fetcher, pom_parser)
+                self.fetch_project(repository, project_id)
             else {
                 continue;
             };
@@ -413,9 +417,9 @@ impl Resolver {
             // merge in the dependencies from the parent POM
             if let Some(parent) = &project.parent {
                 let parent_project =
-                    self.build_effective_pom(&parent.artifact_fqn, url_fetcher, pom_parser)?;
+                    self.build_effective_pom(&parent.artifact_fqn)?;
 
-                log::trace!("got a parent POM: {}", parent_project.artifact_fqn);
+                trace!("got a parent POM: {}", parent_project.artifact_fqn);
 
                 let extra_deps = parent_project
                     .dependencies
@@ -439,11 +443,11 @@ impl Resolver {
                     .collect();
 
                 for bom in boms {
-                    log::trace!("got a BOM artifact: {}", bom.artifact_fqn);
+                    trace!("got a BOM artifact: {}", bom.artifact_fqn);
 
                     // TODO add protection against infinite recursion
                     let bom_project =
-                        self.build_effective_pom(&bom.artifact_fqn, url_fetcher, pom_parser)?;
+                        self.build_effective_pom(&bom.artifact_fqn)?;
 
                     if let Some(DependencyManagement {
                         dependencies: bom_deps,
@@ -457,38 +461,33 @@ impl Resolver {
             return Ok(project);
         }
 
-        Err(ResolverError::file_not_found("not found"))
+        Err(ResolverError::file_not_found(&format!("{}", project_id)))
     }
 
-    pub fn fetch_project<UF, P>(
+    pub fn fetch_project(
         &self,
         repository: &Repository,
-        project_id: &ArtifactFqn,
-        url_fetcher: &UF,
-        pom_parser: &P,
+        project_id: &Artifact,
     ) -> Result<Project, ResolverError>
-    where
-        UF: UrlFetcher,
-        P: PomParser,
     {
         // we're looking only for POMs here
         let project_id = project_id.with_packaging("pom");
 
         // check the cache first
-        if let Some(cached_project) = self.project_cache.lock().get(&project_id) {
-            log::debug!("returning from cache {}...", project_id);
+        if let Some(cached_project) = self.project_cache.borrow().get(&project_id) {
+            debug!("returning from cache {}...", project_id);
             return Ok(cached_project.clone());
         }
 
         // grab the remote POM
         let url = Self::create_url_with_repository(repository, &project_id)?;
 
-        log::debug!("fetching {}...", url);
-        let text = url_fetcher.fetch(&url)?;
+        debug!("fetching {}...", url);
+        let text = self.url_fetcher.fetch(&url)?;
 
         // parse the POM - it will be our "root" project
         // TODO handle multiple "roots"
-        let mut project = pom_parser.parse(text)?;
+        let mut project = self.pom_parser.parse(text)?;
 
         // make sure the packaging type is set to "pom"
         let mut project_id = project.artifact_fqn.with_packaging("pom");
@@ -519,11 +518,61 @@ impl Resolver {
 
         // we're going to save all parsed projects into a HashMap
         // as a "cache"
-        log::trace!("caching {}", project_id);
+        trace!("caching {}", project_id);
         self.project_cache
-            .lock()
+            .borrow_mut()
             .insert(project_id, project.clone());
 
         Ok(project)
+    }
+
+    pub fn download_all_jars(
+        &self,
+        root_artifacts: &[Artifact],
+        root_directory: &Path,
+    ) -> HashSet<Artifact>
+    {
+        let mut todo = VecDeque::new();
+        todo.extend(root_artifacts.iter().cloned());
+
+        let mut done = HashSet::new();
+
+        while let Some(artifact) = todo.pop_front() {
+            if !done.insert(artifact.clone()) {
+                continue;
+            }
+
+            debug!("Resolving {}...", artifact);
+
+            let project = self
+                .build_effective_pom(&artifact)
+                .unwrap();
+
+            let _ = std::fs::create_dir_all(
+                root_directory.join(project.artifact_fqn.artifact_id.as_ref().unwrap()),
+            );
+
+            let extract_path = PathBuf::from(
+                root_directory.join(project.artifact_fqn.with_packaging("jar").filename()),
+            );
+
+            if !extract_path.exists() {
+                let package = self
+                    .try_download_package(&project.artifact_fqn)
+                    .unwrap();
+
+                package.extract_jar_file(&extract_path).unwrap();
+            }
+
+            for dep in project
+                .dependencies
+                .values()
+                .filter(|dep| dep.scope.as_deref() == Some("compile"))
+            {
+                todo.push_back(dep.artifact_fqn.clone());
+            }
+        }
+
+        done.into_iter().map(|a| a.with_packaging("jar")).collect()
     }
 }

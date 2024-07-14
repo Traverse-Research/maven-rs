@@ -15,7 +15,8 @@ impl UrlFetcher for DefaultUrlFetcher {
             .call()
             .map_err(|_| ResolverError::file_not_found(url))?
             .into_reader()
-            .read_to_end(&mut data);
+            .read_to_end(&mut data)
+            .unwrap();
         Ok(data.into())
     }
 }
@@ -34,8 +35,8 @@ fn node_text<'a, 'input: 'a>(parent: &'input roxmltree::Node, tag_name: &'a str)
     n.text().map(|t| t.to_owned())
 }
 
-fn parse_gav(n: &roxmltree::Node) -> ArtifactFqn {
-    ArtifactFqn {
+fn parse_gav(n: &roxmltree::Node) -> Artifact {
+    Artifact {
         group_id: node_text(n, "groupId"),
         artifact_id: node_text(n, "artifactId"),
         version: node_text(n, "version"),

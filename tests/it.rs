@@ -10,7 +10,7 @@ fn init() {
 fn test_build_effective_pom() {
     init();
 
-    let root = ArtifactFqn::pom(
+    let root = Artifact::pom(
         "com.walmartlabs.concord.plugins.basic",
         "smtp-tasks",
         "1.76.1",
@@ -48,7 +48,7 @@ fn test_build_effective_pom() {
 fn test_fetch_project() {
     init();
 
-    let root = ArtifactFqn::pom(
+    let root = Artifact::pom(
         "com.walmartlabs.concord.plugins.basic",
         "smtp-tasks",
         "1.76.1",
@@ -80,7 +80,7 @@ fn test_fetch_project() {
 #[test]
 #[cfg(feature = "default-impl")]
 fn test_classifier() {
-    let root = ArtifactFqn::new(
+    let root = Artifact::new(
         "com.walmartlabs.concord.runtime.v2",
         "concord-runner-v2",
         "1.77.0",

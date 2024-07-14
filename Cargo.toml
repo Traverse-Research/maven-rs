@@ -1,5 +1,5 @@
 [package]
-name = "maven-toolbox"
+name = "maven"
 description = "A collection of Maven-related utilities."
 version = "0.0.2"
 authors = ["Ivan Bodrov <ibodrov@gmail.com>"]
