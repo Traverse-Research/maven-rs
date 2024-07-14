@@ -1,4 +1,5 @@
 /target
+/classes
 Cargo.lock
 .idea
 *.iml

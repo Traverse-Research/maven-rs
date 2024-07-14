@@ -3,8 +3,20 @@ pub struct DefaultUrlFetcher {}
 
 impl UrlFetcher for DefaultUrlFetcher {
     fn fetch(&self, url: &str) -> Result<String, ResolverError> {
-        let text = ureq::get(url.into()).call().unwrap().into_string();
+        let text = ureq::get(url.into())
+            .call()
+            .map_err(|_| ResolverError::file_not_found(url))?
+            .into_string();
         Ok(text.unwrap())
+    }
+    fn fetch_bytes(&self, url: &str) -> Result<bytes::Bytes, ResolverError> {
+        let mut data = vec![];
+        ureq::get(url.into())
+            .call()
+            .map_err(|_| ResolverError::file_not_found(url))?
+            .into_reader()
+            .read_to_end(&mut data);
+        Ok(data.into())
     }
 }
 

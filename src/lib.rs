@@ -28,10 +28,41 @@
 //! The [`default_impl`] module provides minimal implementations of of those
 //! traits.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[cfg(feature = "default-impl")]
 pub mod default_impl;
+
+pub enum Packaging {
+    Aar(bytes::Bytes),
+    Jar(bytes::Bytes),
+}
+
+impl Packaging {
+    pub fn extract_jar_file(
+        &self,
+        location: &std::path::Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        match self {
+            Self::Aar(bytes) => {
+                use std::io::Read;
+
+                let zip_file = zip::read::ZipArchive::new(std::io::Cursor::new(bytes));
+
+                let mut bytes = vec![];
+                zip_file?.by_name("classes.jar")?.read_to_end(&mut bytes);
+                std::fs::write(location, bytes)?;
+                Ok(())
+            }
+            Self::Jar(bytes) => {
+                std::fs::write(location, bytes)?;
+                Ok(())
+            }
+        }
+    }
+}
 
 #[derive(Default, Debug, Clone, Eq, PartialEq, Hash)]
 pub struct ArtifactFqn {
@@ -198,6 +229,7 @@ pub struct Repository {
 #[derive(Debug)]
 pub enum ErrorKind {
     ClientError,
+    FileNotFound,
     // RepositoryError,
 }
 
@@ -228,10 +260,18 @@ impl ResolverError {
             msg: format!("Can't resolve {:?}: {}", artifact_id, cause),
         }
     }
+
+    pub fn file_not_found(url: &str) -> Self {
+        ResolverError {
+            kind: ErrorKind::FileNotFound,
+            msg: format!("Can't find {}", url),
+        }
+    }
 }
 
 pub trait UrlFetcher {
     fn fetch(&self, url: &str) -> Result<String, ResolverError>;
+    fn fetch_bytes(&self, url: &str) -> Result<bytes::Bytes, ResolverError>;
 }
 
 pub trait PomParser {
@@ -239,17 +279,17 @@ pub trait PomParser {
 }
 
 pub struct Resolver {
-    pub repository: Repository,
-    pub project_cache: HashMap<ArtifactFqn, Project>,
+    pub repositories: Vec<Arc<Repository>>,
+    pub project_cache: Mutex<HashMap<ArtifactFqn, Project>>,
 }
 
 impl Default for Resolver {
     fn default() -> Self {
         Resolver {
-            repository: Repository {
+            repositories: vec![Arc::new(Repository {
                 base_url: "https://repo.maven.apache.org/maven2".into(),
-            },
-            project_cache: HashMap::new(),
+            })],
+            project_cache: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -269,7 +309,42 @@ fn normalize_gavs(
 }
 
 impl Resolver {
-    pub fn create_url(&self, id: &ArtifactFqn) -> Result<String, ResolverError> {
+    pub fn try_download_package<UF>(
+        &self,
+        id: &ArtifactFqn,
+        url_fetcher: &UF,
+    ) -> Result<Packaging, ResolverError>
+    where
+        UF: UrlFetcher,
+    {
+        for repository in &self.repositories {
+            for packaging in ["aar", "jar"] {
+                let packaged_id = id.with_packaging(packaging);
+                println!("{}", &id);
+                let url = Self::create_url_with_repository(repository, &packaged_id)?;
+                match url_fetcher.fetch_bytes(&url) {
+                    Ok(bytes) => {
+                        return Ok(match packaging {
+                            "aar" => Packaging::Aar(bytes),
+                            "jar" => Packaging::Jar(bytes),
+                            _ => unimplemented!("Unsupported packaging type {packaging}"),
+                        });
+                    }
+                    err => println!("Trying other packaging: {:?}", err),
+                }
+            }
+        }
+
+        Err(ResolverError::file_not_found(&format!(
+            "{}",
+            id.artifact_id.as_ref().unwrap()
+        )))
+    }
+
+    pub fn create_url_with_repository(
+        repository: &Repository,
+        id: &ArtifactFqn,
+    ) -> Result<String, ResolverError> {
         // a little helper
         fn require<'a, F, D>(
             id: &'a ArtifactFqn,
@@ -285,12 +360,14 @@ impl Resolver {
 
         let group_id = require(id, |id| id.group_id.as_ref(), &"groupId")?;
         let artifact_id = require(id, |id| id.artifact_id.as_ref(), &"artifactId")?;
-        let version = require(id, |id| id.version.as_ref(), &"version")?;
-        let packaging = require(id, |id| id.packaging.as_ref(), &"packaging")?;
+        let version = require(id, |id| id.version.as_ref(), &"version")?
+            .replace("[", "")
+            .replace("]", "");
+        let packaging = id.packaging.as_ref().map(|s| s.as_str()).unwrap_or("jar");
 
         let mut url = format!(
             "{}/{}/{}/{}/{}-{}",
-            self.repository.base_url,
+            repository.base_url,
             group_id.replace(".", "/"),
             artifact_id,
             version,
@@ -308,7 +385,7 @@ impl Resolver {
     }
 
     pub fn build_effective_pom<UF, P>(
-        &mut self,
+        &self,
         project_id: &ArtifactFqn,
         url_fetcher: &UF,
         pom_parser: &P,
@@ -320,64 +397,72 @@ impl Resolver {
         log::debug!("building an effective pom for {}", project_id);
 
         let project_id = &project_id.with_packaging("pom");
+        for repository in &self.repositories {
+            let Ok(mut project) =
+                self.fetch_project(repository, project_id, url_fetcher, pom_parser)
+            else {
+                continue;
+            };
 
-        let mut project = self.fetch_project(project_id, url_fetcher, pom_parser)?;
-
-        if let Some(version) = &project_id.version {
-            project
-                .properties
-                .insert("project.version".to_owned(), version.clone());
-        }
-
-        // merge in the dependencies from the parent POM
-        if let Some(parent) = &project.parent {
-            let parent_project =
-                self.build_effective_pom(&parent.artifact_fqn, url_fetcher, pom_parser)?;
-
-            log::trace!("got a parent POM: {}", parent_project.artifact_fqn);
-
-            let extra_deps = parent_project
-                .dependencies
-                .into_iter()
-                .filter(|(dep_key, _)| !project.dependencies.contains_key(dep_key))
-                .collect::<HashMap<_, _>>();
-
-            project.dependencies.extend(extra_deps);
-        }
-
-        if let Some(mut project_dm) = project.dependency_management.clone() {
-            for (_, dep) in &mut project_dm.dependencies {
-                dep.artifact_fqn = dep.artifact_fqn.interpolate(&project.properties);
+            if let Some(version) = &project_id.version {
+                project
+                    .properties
+                    .insert("project.version".to_owned(), version.clone());
             }
 
-            let boms: Vec<Dependency> = project_dm
-                .dependencies
-                .iter()
-                .filter(|(_, dep)| dep.scope.as_deref() == Some("import"))
-                .map(|(_, dep)| dep.clone())
-                .collect();
+            // merge in the dependencies from the parent POM
+            if let Some(parent) = &project.parent {
+                let parent_project =
+                    self.build_effective_pom(&parent.artifact_fqn, url_fetcher, pom_parser)?;
 
-            for bom in boms {
-                log::trace!("got a BOM artifact: {}", bom.artifact_fqn);
+                log::trace!("got a parent POM: {}", parent_project.artifact_fqn);
 
-                // TODO add protection against infinite recursion
-                let bom_project =
-                    self.build_effective_pom(&bom.artifact_fqn, url_fetcher, pom_parser)?;
+                let extra_deps = parent_project
+                    .dependencies
+                    .into_iter()
+                    .filter(|(dep_key, _)| !project.dependencies.contains_key(dep_key))
+                    .collect::<HashMap<_, _>>();
 
-                if let Some(DependencyManagement {
-                    dependencies: bom_deps,
-                }) = bom_project.dependency_management
-                {
-                    project_dm.dependencies.extend(bom_deps);
+                project.dependencies.extend(extra_deps);
+            }
+
+            if let Some(mut project_dm) = project.dependency_management.clone() {
+                for (_, dep) in &mut project_dm.dependencies {
+                    dep.artifact_fqn = dep.artifact_fqn.interpolate(&project.properties);
                 }
-            }
-        };
 
-        Ok(project)
+                let boms: Vec<Dependency> = project_dm
+                    .dependencies
+                    .iter()
+                    .filter(|(_, dep)| dep.scope.as_deref() == Some("import"))
+                    .map(|(_, dep)| dep.clone())
+                    .collect();
+
+                for bom in boms {
+                    log::trace!("got a BOM artifact: {}", bom.artifact_fqn);
+
+                    // TODO add protection against infinite recursion
+                    let bom_project =
+                        self.build_effective_pom(&bom.artifact_fqn, url_fetcher, pom_parser)?;
+
+                    if let Some(DependencyManagement {
+                        dependencies: bom_deps,
+                    }) = bom_project.dependency_management
+                    {
+                        project_dm.dependencies.extend(bom_deps);
+                    }
+                }
+            };
+
+            return Ok(project);
+        }
+
+        Err(ResolverError::file_not_found("not found"))
     }
 
     pub fn fetch_project<UF, P>(
-        &mut self,
+        &self,
+        repository: &Repository,
         project_id: &ArtifactFqn,
         url_fetcher: &UF,
         pom_parser: &P,
@@ -390,13 +475,13 @@ impl Resolver {
         let project_id = project_id.with_packaging("pom");
 
         // check the cache first
-        if let Some(cached_project) = self.project_cache.get(&project_id) {
+        if let Some(cached_project) = self.project_cache.lock().get(&project_id) {
             log::debug!("returning from cache {}...", project_id);
             return Ok(cached_project.clone());
         }
 
         // grab the remote POM
-        let url = self.create_url(&project_id)?;
+        let url = Self::create_url_with_repository(repository, &project_id)?;
 
         log::debug!("fetching {}...", url);
         let text = url_fetcher.fetch(&url)?;
@@ -435,7 +520,9 @@ impl Resolver {
         // we're going to save all parsed projects into a HashMap
         // as a "cache"
         log::trace!("caching {}", project_id);
-        self.project_cache.insert(project_id, project.clone());
+        self.project_cache
+            .lock()
+            .insert(project_id, project.clone());
 
         Ok(project)
     }

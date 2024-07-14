@@ -3,7 +3,7 @@ name = "maven-toolbox"
 description = "A collection of Maven-related utilities."
 version = "0.0.2"
 authors = ["Ivan Bodrov <ibodrov@gmail.com>"]
-edition = "2018"
+edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/concord-workflow/maven-toolbox-rs"
 readme = "README.md"
@@ -13,9 +13,12 @@ default-impl = ["ureq", "roxmltree"]
 default = ["default-impl"]
 
 [dependencies]
-log = "0.4.11"
-ureq = { optional = true, version = "2.0.0", default-features = false, features = ["tls"] }
-roxmltree = { optional = true, version = "0.14.0" }
+log = "0.4.22"
+ureq = { optional = true, version = "2.10.0", default-features = false, features = ["tls"] }
+roxmltree = { optional = true, version = "0.20" }
+parking_lot = "0.12"
+bytes = "1.6"
+zip = "2.1.3"
 
 [dev-dependencies]
 env_logger = "0.8.2"

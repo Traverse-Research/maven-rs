@@ -85,7 +85,7 @@ fn test_classifier() {
         "concord-runner-v2",
         "1.77.0",
         "jar",
-        "jar-with-dependencies"
+        "jar-with-dependencies",
     );
 
     let resolver = Resolver::default();
