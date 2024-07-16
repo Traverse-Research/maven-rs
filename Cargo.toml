@@ -1,11 +1,11 @@
 [package]
-name = "maven"
+name = "maven-rs"
 description = "A collection of Maven-related utilities."
 version = "0.0.2"
 authors = ["Ivan Bodrov <ibodrov@gmail.com>"]
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/concord-workflow/maven-toolbox-rs"
+repository = "https://github.com/Traverse-Research/maven-rs"
 readme = "README.md"
 
 [features]
